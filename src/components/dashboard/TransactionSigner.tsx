@@ -22,12 +22,42 @@ import { useWriteGuard } from '../../hooks/useWriteGuard';
 import { inspectEnvelope } from '../../utils/feeBumpInspector';
 import type { EnvelopeInfo } from '../../utils/feeBumpInspector';
 import { setCriticalSigningActive } from '../../utils/offline';
+import { useSigningRequestGuard } from '../../hooks/useSigningRequestGuard';
+import type { SigningExpiryNotice as SigningExpiryNoticeData } from '../../hooks/useSigningRequestGuard';
+import type { SigningRequest } from '../../lib/wallet/signingRequests';
+import SigningExpiryNotice from '../security/SigningExpiryNotice';
+import { trackSecurityEvent, SecurityEventType } from '../../lib/securityEvents';
+import type { NetworkName } from '../../lib/stellar';
 
 interface MainnetReviewItem {
   label: string;
   value: string;
   highlight?: boolean;
   mono?: boolean;
+}
+
+/**
+ * Record that a pending signature request was cancelled (#1190). Carries the
+ * reason and ids only, never the transaction or any key material, and must
+ * never break the signing UI.
+ */
+function recordSigningExpiry(notice: SigningExpiryNoticeData, request: SigningRequest): void {
+  try {
+    void Promise.resolve(
+      trackSecurityEvent(SecurityEventType.WALLET_SIGN_REJECTED, {
+        actor: request.context.walletPublicKey ?? undefined,
+        target: request.context.network,
+        outcome: 'denied',
+        metadata: {
+          reason: notice.reason,
+          requestId: notice.requestId,
+          walletType: request.context.walletType,
+        },
+      })
+    ).catch(() => {});
+  } catch {
+    /* auditing must never interfere with signing */
+  }
 }
 
 export default function TransactionSigner() {
@@ -64,6 +94,46 @@ export default function TransactionSigner() {
 
   // ─── Behavioral Biometrics ─────────────────────────────────────────────────
   const bio = useBehavioralBiometrics(walletPublicKey);
+
+  // ─── Pending signature request expiry (#1190) ──────────────────────────────
+  // Delayed flow steps (biometric auto-proceed) are tracked so they can be
+  // cancelled when the request expires or the component unmounts.
+  const flowTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  const clearFlowTimers = () => {
+    flowTimersRef.current.forEach((id) => clearTimeout(id));
+    flowTimersRef.current.clear();
+  };
+  useEffect(() => {
+    const timers = flowTimersRef.current;
+    return () => {
+      timers.forEach((id) => clearTimeout(id));
+      timers.clear();
+    };
+  }, []);
+
+  const signingGuard = useSigningRequestGuard(
+    { walletConnected, walletType, walletPublicKey, network },
+    {
+      onExpire: (notice, request) => {
+        clearFlowTimers();
+        setShowBiometricOverlay(false);
+        setShowMainnetReview(false);
+        setShowConfirmation(false);
+        cancelRiskReview();
+        bio.abort();
+        recordSigningExpiry(notice, request);
+      },
+    }
+  );
+
+  const scheduleFlowStep = (request: SigningRequest, delayMs: number, step: () => void) => {
+    const id = setTimeout(() => {
+      flowTimersRef.current.delete(id);
+      if (!signingGuard.ensureCurrent(request)) return;
+      step();
+    }, delayMs);
+    flowTimersRef.current.add(id);
+  };
 
   const [accountInfo, setAccountInfo] = useState<any>(null);
 
@@ -111,8 +181,15 @@ export default function TransactionSigner() {
   };
 
   const _runSignFlow = async () => {
+    // #1190 — bind the request to the wallet/account/network the user acted
+    // on. If the context already moved on (e.g. the mainnet confirmation
+    // dialog stayed open while the network changed) this expires immediately.
+    const request = signingGuard.begin({ walletConnected, walletType, walletPublicKey, network });
+    if (!request) return;
+
     if (bio.enabled && bio.isEstablished) {
       const result = await bio.evaluateAndRecord();
+      if (!signingGuard.ensureCurrent(request)) return;
       if (result) {
         setShowBiometricOverlay(true);
         // For strict mode anomalies, stop here — overlay handles cancel
@@ -120,10 +197,10 @@ export default function TransactionSigner() {
         // For non-anomaly or warn mode, overlay will call onDismiss/onProceedAnyway
         if (!result.isAnomaly) {
           // Auto-dismiss quickly for a passed check — show briefly then proceed
-          setTimeout(() => {
+          scheduleFlowStep(request, 1200, () => {
             setShowBiometricOverlay(false);
             _proceedToSign();
-          }, 1200);
+          });
           return;
         }
         // Anomaly in warn mode: wait for user action via overlay
@@ -132,12 +209,13 @@ export default function TransactionSigner() {
     } else if (bio.enabled && !bio.isEstablished) {
       // Learning mode: still evaluate (returns learning result) and show briefly
       const result = await bio.evaluateAndRecord();
+      if (!signingGuard.ensureCurrent(request)) return;
       if (result) {
         setShowBiometricOverlay(true);
-        setTimeout(() => {
+        scheduleFlowStep(request, 1500, () => {
           setShowBiometricOverlay(false);
           _proceedToSign();
-        }, 1500);
+        });
         return;
       }
     }
@@ -146,9 +224,15 @@ export default function TransactionSigner() {
   };
 
   const _proceedToSign = async () => {
+    // #1190 — a request that expired (or was never started) must not continue.
+    const pending = signingGuard.getActive();
+    if (!pending || !signingGuard.ensureCurrent(pending)) return;
     // On Mainnet, show the explicit review step before confirmation/signing
     if (network === 'mainnet' && !showMainnetReview) {
       setShowMainnetReview(true);
+      // This step halts the flow without asking the wallet, so the request is
+      // finished rather than left to raise a timeout notice later (#1190).
+      signingGuard.end();
       return;
     }
     if (preferences.transactionConfirmation.enabled) {
@@ -206,6 +290,14 @@ export default function TransactionSigner() {
   };
 
   const doSign = async () => {
+    // #1190 — sign only for a live request. Entry points that did not start
+    // one (the risk-review acknowledgement) begin it here against the current
+    // context, which preserves their previous behaviour.
+    const request =
+      signingGuard.getActive() ??
+      signingGuard.begin({ walletConnected, walletType, walletPublicKey, network });
+    if (!request || !signingGuard.ensureCurrent(request)) return;
+
     setSigning(true);
     setError(null);
     setSignedXdr(null);
@@ -214,13 +306,20 @@ export default function TransactionSigner() {
     setCriticalSigningActive(true);
 
     try {
-      if (!walletType) throw new Error('No wallet connected. Connect a wallet first.');
-      setLedgerPrompt(walletType === 'ledger');
+      const signWith = request.context.walletType;
+      if (!signWith) throw new Error('No wallet connected. Connect a wallet first.');
+      setLedgerPrompt(signWith === 'ledger');
+      const signingNetwork = request.context.network as NetworkName;
       const result = await measureAsync(
         'TRANSACTION_SIGNING_DURATION',
-        () => getWalletAdapter(walletType).signTransaction(xdr.trim(), network),
-        { network, walletType }
+        () => getWalletAdapter(signWith).signTransaction(xdr.trim(), signingNetwork),
+        { network: signingNetwork, walletType: signWith }
       );
+
+      // The wallet may have been left, switched or re-pointed while its prompt
+      // was open. The signature is then for a context the user no longer has,
+      // so it is discarded rather than shown.
+      if (!signingGuard.ensureCurrent(request)) return;
 
       setSignedXdr(result);
       // Record this successful sign to the behavioral profile
@@ -228,8 +327,12 @@ export default function TransactionSigner() {
         bio.recordSuccessfulSign().catch(() => {});
       }
     } catch (err: unknown) {
+      // An expiry already told the user why; a wallet error that follows it
+      // is a consequence, not a second problem to report.
+      if (!signingGuard.ensureCurrent(request)) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
+      signingGuard.end();
       setLedgerPrompt(false);
       setSigning(false);
       // #886 — Signing is over: a service-worker update deferred during the
@@ -245,6 +348,7 @@ export default function TransactionSigner() {
 
   const handleCancelConfirmation = () => {
     setShowConfirmation(false);
+    signingGuard.end();
     bio.abort();
   };
 
@@ -256,6 +360,7 @@ export default function TransactionSigner() {
 
   const handleBiometricCancel = () => {
     setShowBiometricOverlay(false);
+    signingGuard.end();
     bio.abort();
   };
 
@@ -274,6 +379,8 @@ export default function TransactionSigner() {
 
   if (!walletConnected) {
     return (
+      <>
+      <SigningExpiryNotice notice={signingGuard.notice} onDismiss={signingGuard.dismissNotice} />
       <Card title="Transaction Signer" subtitle="Sign transactions with your wallet">
         <div
           style={{
@@ -291,6 +398,7 @@ export default function TransactionSigner() {
           </span>
         </div>
       </Card>
+      </>
     );
   }
 
@@ -329,6 +437,23 @@ export default function TransactionSigner() {
     <>
       {/* #983 — mainnet write guard dialog */}
       <MainnetConfirmDialog {...dialogProps} />
+      <SigningExpiryNotice notice={signingGuard.notice} onDismiss={signingGuard.dismissNotice} />
+      {error && (
+        <div
+          role="alert"
+          style={{
+            background: 'rgba(255,23,68,0.08)',
+            border: '1px solid var(--red)',
+            borderRadius: 'var(--radius-md)',
+            padding: '10px 14px',
+            marginBottom: '12px',
+            fontSize: '12px',
+            color: 'var(--red)',
+          }}
+        >
+          {error}
+        </div>
+      )}
       {isReadOnlyLocked && (
         <div style={{
           background: 'rgba(255,23,68,0.08)',

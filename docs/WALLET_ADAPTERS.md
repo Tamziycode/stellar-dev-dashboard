@@ -12,6 +12,8 @@ Adapters report capabilities explicitly. Ledger supports transaction signing but
 
 Before a signature request, the adapter compares the provider's current network with the dashboard network and parses transaction XDR against that network's Stellar passphrase. A mismatch or unknown network prevents the wallet prompt. Do not weaken these checks to make a provider work; extend its `getNetwork` implementation to return a verified network identifier instead. Wallet adapters never receive secret keys.
 
+Signature requests started from Transaction Signer are bound to the wallet, account and network active when they began. If any of them change, or the request outlives its 5-minute lifetime, the request is cancelled before the adapter is called and any late signature is discarded. See [security/wallet-signing-request-expiry.md](security/wallet-signing-request-expiry.md).
+
 ## E2E Tests
 
 Wallet e2e flows use the generic `mockWalletAdapter` fixture controls. The fixture exposes the mock through the Freighter-compatible injected API so it exercises the same adapter boundary as the browser extension. Unit tests for the registry live under `src/lib/wallet/__tests__`.

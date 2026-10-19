@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Expire pending signature requests after network or account changes** ([#1190](https://github.com/Nanle-code/stellar-dev-dashboard/issues/1190)).
+  A signature request in Transaction Signer is now bound to the wallet, account and network it started in, and is cancelled (with an alert and a `wallet.sign.rejected` audit event) if any of them change or it outlives 5 minutes. A signature returned after such a change is discarded.
+  - `src/lib/wallet/signingRequests.ts`, `src/hooks/useSigningRequestGuard.ts`, `src/components/security/SigningExpiryNotice.tsx`
+  - Transaction Signer now displays wallet errors, which were previously set but never rendered
+  - Documentation: `docs/security/wallet-signing-request-expiry.md`, threat model, wallet adapters, `SECURITY.md`
+
 - **Shared core package** ([#1006](https://github.com/Nanle-code/stellar-dev-dashboard/issues/1006)).
   Extracted platform-agnostic Stellar logic into `@stellar-dev-dashboard/core` workspace package, eliminating duplicated code between web (`src/lib/stellar/`) and mobile (`mobile/src/services/stellar.ts`) apps.
   - `packages/core/src/networks.ts` — Network configuration, `getServer`, `getSorobanServer`

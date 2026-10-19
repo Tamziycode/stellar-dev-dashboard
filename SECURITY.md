@@ -12,6 +12,12 @@ Connected wallets are disconnected after a configurable idle period (default
 15 minutes) with a confirmation prompt first. See
 [`docs/security/wallet-idle-timeout.md`](docs/security/wallet-idle-timeout.md).
 
+## Pending signature request expiry
+
+A signature request is cancelled if the wallet, account or network changes
+before the wallet is asked to sign, or after 5 minutes. See
+[`docs/security/wallet-signing-request-expiry.md`](docs/security/wallet-signing-request-expiry.md).
+
 ## Code owners for security-sensitive paths
 
 Wallet, authentication, cryptography, and CI paths require review from the
